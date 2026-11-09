@@ -1,6 +1,47 @@
-# Automation runtime state (local)
+# --- Automation runtime state (local) ---
 automation/state.json
 automation/.worker.lock
 automation/*.log
 tmp-automation/
 __pycache__/
+
+# --- Unity generated ---
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+
+# Asset meta files should NOT be ignored (Unity needs them)
+
+# --- IDE / editor ---
+.vs/
+.idea/
+.consulo/
+*.csproj
+*.unityproj
+*.sln
+*.slnx
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code (optional local settings)
+.vscode/
