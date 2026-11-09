@@ -2,11 +2,14 @@
 
 ## Issue polling (`poll_issues.py`)
 
-Polls open GitHub issues for `stkraine/kraineArcade`, logs new issues, and adds the `agent:seen` label to avoid duplicates.
+Polls open GitHub issues for `stkraine/kraineArcade`, logs new issues, adds the `agent:seen` label to avoid duplicates, and (optionally) updates **GitHub Project (v2)** status.
+
+**Default project behavior (configurable via env vars):** when a new issue is seen, the script sets its Status to **Ready** in `@stkraine` Project **#2** (“@stkraine’s untitled project”). Set `ENABLE_PROJECT_STATUS=0` to disable.
 
 ### Prerequisites
 - [GitHub CLI (`gh`)](https://cli.github.com/) installed
 - Auth via `gh auth login` **or** `GH_TOKEN`/`GITHUB_PAT` environment variable
+- For Project status updates: token/auth must include **Projects (v2) write** access (classic PAT: `project` scope; `gh auth refresh -h github.com -s project`)
 
 ### Run manually
 ```bash

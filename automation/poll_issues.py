@@ -4,11 +4,12 @@ Poll GitHub issues for stkraine/kraineArcade and log new (unseen) issues.
 
 - Picks up all open issues.
 - Tracks "seen" issues by adding the `agent:seen` label.
+- Moves newly seen issues to "Ready" in GitHub Project (v2) when configured.
 - MVP action: logs new issues to stdout (and optionally a log file).
 
 Requirements:
-- GitHub CLI (`gh`) installed and authenticated, OR GH_TOKEN/GITHUB_PAT set.
-- Run from cron or manually.
+- GitHub CLI (`gh`) installed and authenticated.
+- For Project status updates: `gh` auth/PAT must have Projects write scope (`project`).
 
 Cron example (every 1 minute):
   * * * * * cd /home/steven/Projects/kraineArcade && /usr/bin/env GH_TOKEN="$GITHUB_PAT" /usr/bin/python3 automation/poll_issues.py >> /tmp/kraineArcade-poll.log 2>&1
@@ -21,13 +22,21 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = os.environ.get("GITHUB_REPO", "stkraine/kraineArcade")
 SEEN_LABEL = os.environ.get("AGENT_SEEN_LABEL", "agent:seen")
 LOG_FILE = os.environ.get("POLL_LOG_FILE")  # optional
+
+# GitHub Projects (v2) integration (optional but enabled by default for this repo)
+PROJECT_OWNER = os.environ.get("PROJECT_OWNER", "stkraine")
+PROJECT_NUMBER = os.environ.get("PROJECT_NUMBER", "2")
+PROJECT_ID = os.environ.get("PROJECT_ID", "PVT_kwHOBIs4f84BqxEy")
+PROJECT_STATUS_FIELD_ID = os.environ.get("PROJECT_STATUS_FIELD_ID", "PVTSSF_lAHOBIs4f84BqxEyzhpGrzE")
+PROJECT_STATUS_READY_OPTION_ID = os.environ.get("PROJECT_STATUS_READY_OPTION_ID", "61e4505c")
+PROJECT_STATUS_IN_REVIEW_OPTION_ID = os.environ.get("PROJECT_STATUS_IN_REVIEW_OPTION_ID", "df73e18b")
+ENABLE_PROJECT_STATUS = os.environ.get("ENABLE_PROJECT_STATUS", "1") not in ("0", "false", "False")
 
 
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -70,7 +79,6 @@ def ensure_label() -> None:
     )
     if result.returncode == 0:
         log(f"Created label '{SEEN_LABEL}'")
-    # If it failed, it may already exist; that's fine.
 
 
 def fetch_open_issues() -> list[dict]:
@@ -113,6 +121,93 @@ def mark_seen(number: int) -> None:
     )
 
 
+def find_project_item_id(issue_number: int) -> str | None:
+    """Find the Project v2 item ID for an issue number in the configured project."""
+    result = run(
+        [
+            "gh",
+            "project",
+            "item-list",
+            PROJECT_NUMBER,
+            "--owner",
+            PROJECT_OWNER,
+            "--limit",
+            "200",
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    for item in data.get("items") or []:
+        content = item.get("content") or {}
+        if content.get("type") == "Issue" and content.get("number") == issue_number:
+            if content.get("repository") == REPO:
+                return item.get("id")
+    return None
+
+
+def ensure_project_item(issue_url: str, issue_number: int) -> str | None:
+    """Ensure issue is added to the project and return its item ID."""
+    item_id = find_project_item_id(issue_number)
+    if item_id:
+        return item_id
+    # Try to add; ignore errors (may already exist or lack permission)
+    run(
+        [
+            "gh",
+            "project",
+            "item-add",
+            PROJECT_NUMBER,
+            "--owner",
+            PROJECT_OWNER,
+            "--url",
+            issue_url,
+        ],
+        check=False,
+    )
+    return find_project_item_id(issue_number)
+
+
+def set_project_status(issue_url: str, issue_number: int, option_id: str, status_name: str) -> None:
+    """Best-effort update of Project v2 Status field."""
+    if not ENABLE_PROJECT_STATUS:
+        return
+    try:
+        item_id = ensure_project_item(issue_url, issue_number)
+        if not item_id:
+            log(f"WARN: could not find/add project item for issue #{issue_number}; skipping status update")
+            return
+        result = run(
+            [
+                "gh",
+                "project",
+                "item-edit",
+                "--id",
+                item_id,
+                "--project-id",
+                PROJECT_ID,
+                "--field-id",
+                PROJECT_STATUS_FIELD_ID,
+                "--single-select-option-id",
+                option_id,
+            ],
+            check=False,
+        )
+        if result.returncode == 0:
+            log(f"Project status for issue #{issue_number} set to '{status_name}'")
+        else:
+            err = (result.stderr or result.stdout or "").strip()
+            log(f"WARN: failed to set project status for issue #{issue_number}: {err}")
+    except Exception as e:
+        log(f"WARN: project status update error for issue #{issue_number}: {e}")
+
+
 def main() -> int:
     try:
         ensure_label()
@@ -143,7 +238,7 @@ def main() -> int:
             log(f"Labeled issue #{num} with '{SEEN_LABEL}'")
         except subprocess.CalledProcessError as e:
             log(f"ERROR: failed to label issue #{num}: {e.stderr.strip() or e}")
-            # Continue processing others
+        set_project_status(url, num, PROJECT_STATUS_READY_OPTION_ID, "Ready")
     return 0
 
 
