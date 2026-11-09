@@ -7,7 +7,7 @@ using System;
 public class Tetromino
 {
     public TetrominoType Type { get; private set; }
-    public RotationState Rotation { get; private set; }
+    public RotationState Rotation { get; set; }
     public GridPosition Position { get; set; }
 
     public Tetromino(TetrominoType type)
