@@ -1,15 +1,25 @@
 # Automation
 
-## Issue polling (`poll_issues.py`)
+## Automation worker (`poll_issues.py`)
 
-Polls open GitHub issues for `stkraine/kraineArcade`, logs new issues, adds the `agent:seen` label to avoid duplicates, and (optionally) updates **GitHub Project (v2)** status.
+Cron-friendly worker for `stkraine/kraineArcade` (Project **#2**, “@stkraine’s untitled project”).
 
-**Default project behavior (configurable via env vars):** when a new issue is seen, the script sets its Status to **Ready** in `@stkraine` Project **#2** (“@stkraine’s untitled project”). Set `ENABLE_PROJECT_STATUS=0` to disable.
+- Labels unseen open issues with `agent:seen` and moves them to **Ready** (normalizes `Backlog` → `Ready`).
+- **Auto-implements** actionable issues (`Ready`/`Backlog`) **one at a time** when `ENABLE_AUTO_WORK=1` (default): sets **In progress**, runs `opencode run --auto` (no `-m`), then sets **In review** when an open PR is found (or back to **Ready** on failure). Uses `automation/.worker.lock`.
+- **In review feedback:** if new **issue comments** or **PR conversation comments** are detected on an `In review` item, reopens work (`In progress` → address feedback → `In review`). Baselines tracked in `automation/state.json` (gitignored).
+- **PR closed/merged:** moves the Project item to **Done**. Status stays **In review** until then.
 
 ### Prerequisites
-- [GitHub CLI (`gh`)](https://cli.github.com/) installed
-- Auth via `gh auth login` **or** `GH_TOKEN`/`GITHUB_PAT` environment variable
-- For Project status updates: token/auth must include **Projects (v2) write** access (classic PAT: `project` scope; `gh auth refresh -h github.com -s project`)
+- [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
+- [OpenCode CLI](https://opencode.ai) for auto-implementation (`OPENCODE_BIN`, default `~/.opencode/bin/opencode`)
+- Auth/token must include `repo` and **Projects (v2) write** (classic PAT: `project`; or `gh auth refresh -h github.com -s project`)
+- Cron needs `gh`/`opencode` on `PATH` (e.g., add `PATH=/home/steven/.local/bin:/home/steven/.opencode/bin:/usr/bin:/bin` to the cron line)
+
+### Key env vars
+- `ENABLE_AUTO_WORK=0` — disable autonomous implementation (poll/sync only)
+- `ENABLE_PROJECT_STATUS=0` — disable Project status updates
+- `OPENCODE_TIMEOUT_SEC` (default `3600`)
+- `OPENCODE_BIN`, `GH_BIN`, `REPO_DIR`, `LOG_FILE`
 
 ### Run manually
 ```bash
