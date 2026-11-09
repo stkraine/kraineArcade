@@ -46,6 +46,7 @@ PROJECT_STATUS_FIELD_ID = os.environ.get("PROJECT_STATUS_FIELD_ID", "PVTSSF_lAHO
 STATUS_OPTIONS = {
     "Backlog": "f75ad846",
     "Ready": "61e4505c",
+    "Needs info": "6fe10d79",
     "In progress": "47fc9ee4",
     "In review": "df73e18b",
     "Done": "98236657",
@@ -312,7 +313,8 @@ Issue description:
 Requirements:
 - Work in the existing repo. Follow existing conventions and project structure.
 - Use `gh` (already authenticated) and git as needed.
-- Create a feature branch (e.g., `feat/issue-{num}-<slug>`), implement the changes, run relevant tests/checks if present.
+- **If requirements are unclear or you are blocked on a decision you cannot safely make:** post specific clarifying questions as an issue comment (`gh issue comment {num} --repo {REPO} --body "..."`), set GitHub Project #2 status for issue #{num} to **"Needs info"** (field id: {PROJECT_STATUS_FIELD_ID}, option id: {STATUS_OPTIONS['Needs info']}, project id: {PROJECT_ID}; find item id via `gh project item-list 2 --owner {PROJECT_OWNER} --format json` then `gh project item-edit ... --single-select-option-id {STATUS_OPTIONS['Needs info']}`), and **stop without creating a PR**.
+- Otherwise: create a feature branch (e.g., `feat/issue-{num}-<slug>`), implement the changes, run relevant tests/checks if present.
 - Commit with a clear message referencing #{num}.
 - Push the branch and open a PR to `main` with `gh pr create`, including "Closes #{num}" in the PR body.
 - Update GitHub Project #2 (owner {PROJECT_OWNER}, project id {PROJECT_ID}) status for issue #{num} to "In review" when the PR is opened.
@@ -352,6 +354,12 @@ def fetch_issue_body(issue_number: int) -> str:
     return ""
 
 
+def current_project_status(issue_number: int) -> str | None:
+    items = get_project_items()
+    item = project_item_for_issue(items, issue_number)
+    return (item or {}).get("status")
+
+
 def process_actionable_issue(issue: dict[str, Any], item: dict[str, Any], state: dict[str, Any]) -> None:
     num = issue["number"]
     url = issue.get("url", "")
@@ -366,18 +374,24 @@ def process_actionable_issue(issue: dict[str, Any], item: dict[str, Any], state:
         set_project_status(url, num, "In review")
         record_feedback_markers(num, pr.get("number"), state)
         log(f"Issue #{num} -> In review (PR #{pr.get('number')})")
-    elif pr and pr.get("state") == "OPEN":
-        # opencode reported failure but PR exists; treat as in review
+        return
+    if pr and pr.get("state") == "OPEN":
         set_project_status(url, num, "In review")
         record_feedback_markers(num, pr.get("number"), state)
         log(f"Issue #{num} has open PR #{pr.get('number')}; set to In review despite opencode exit status")
-    else:
-        set_project_status(url, num, "Ready")
-        log(f"Issue #{num} returned to Ready (no open PR detected). Check logs.")
+        return
+    # Respect agent-set statuses (e.g., "Needs info" with clarifying questions and no PR)
+    status = current_project_status(num)
+    if status in ("Needs info", "In review", "Done"):
+        record_feedback_markers(num, pr.get("number") if pr else None, state)
+        log(f"Issue #{num} left in '{status}' after run (no open PR).")
+        return
+    set_project_status(url, num, "Ready")
+    log(f"Issue #{num} returned to Ready (no open PR detected). Check logs.")
 
 
 def process_in_review_item(issue: dict[str, Any], item: dict[str, Any], state: dict[str, Any]) -> bool:
-    """Handle In review transitions/feedback. Returns True if it took an action (started work/status change worth stopping cycle)."""
+    """Handle In review transitions/feedback. Returns True if it took an action."""
     num = issue["number"]
     url = issue.get("url", "")
     pr = find_pr_for_issue(num)
@@ -398,6 +412,22 @@ def process_in_review_item(issue: dict[str, Any], item: dict[str, Any], state: d
     run_opencode(prompt, title=f"Feedback #{num}: {issue.get('title','')}"[:80])
     set_project_status(url, num, "In review")
     record_feedback_markers(num, pr_num, state)
+    return True
+
+
+def process_needs_info_item(issue: dict[str, Any], item: dict[str, Any], state: dict[str, Any]) -> bool:
+    """If user replied with a new issue comment, move back to Ready for re-implementation."""
+    num = issue["number"]
+    url = issue.get("url", "")
+    changed, reason, baseline = has_new_feedback(num, None, state)
+    if baseline:
+        record_feedback_markers(num, None, state)
+        return False
+    if not changed:
+        return False
+    log(f"Issue #{num} has {reason}; moving Needs info -> Ready")
+    set_project_status(url, num, "Ready")
+    record_feedback_markers(num, None, state)
     return True
 
 
@@ -440,18 +470,20 @@ def main() -> int:
         # Respect single concurrency: if anything is In progress, do not start new work
         if any((it.get("status") == "In progress") for it in items):
             log("An item is already In progress; skipping new work this cycle.")
-            # Still handle PR closed -> Done transitions? lightweight check
             for it in items:
+                content = it.get("content") or {}
+                if content.get("type") != "Issue" or content.get("repository") != REPO:
+                    continue
+                num = content.get("number")
                 if it.get("status") == "In review":
-                    content = it.get("content") or {}
-                    if content.get("type") == "Issue":
-                        num = content.get("number")
-                        if num in issues_by_num:
-                            process_in_review_item(issues_by_num[num], it, state)
-                        else:
-                            pr = find_pr_for_issue(num)
-                            if pr and pr.get("state") in ("CLOSED", "MERGED"):
-                                set_project_status(content.get("url",""), num, "Done")
+                    if num in issues_by_num:
+                        process_in_review_item(issues_by_num[num], it, state)
+                    else:
+                        pr = find_pr_for_issue(num)
+                        if pr and pr.get("state") in ("CLOSED", "MERGED"):
+                            set_project_status(content.get("url", ""), num, "Done")
+                elif it.get("status") == "Needs info" and num in issues_by_num:
+                    process_needs_info_item(issues_by_num[num], it, state)
             save_state(state)
             return 0
 
@@ -477,6 +509,19 @@ def main() -> int:
             # record baseline markers to avoid treating old comments as new
             pr = find_pr_for_issue(num)
             record_feedback_markers(num, pr.get("number") if pr else None, state)
+
+        # Needs info: if user replied, move back to Ready (resume next cycle)
+        for it in items:
+            if it.get("status") != "Needs info":
+                continue
+            content = it.get("content") or {}
+            if content.get("type") == "Issue" and content.get("repository") == REPO:
+                num = content.get("number")
+                if num in issues_by_num and process_needs_info_item(issues_by_num[num], it, state):
+                    save_state(state)
+                    return 0
+        # Refresh items if needed (status may have changed externally; cheap enough to proceed)
+        items = get_project_items() if ENABLE_PROJECT_STATUS else []
 
         # Phase 1: pick one actionable issue
         actionable_statuses = {"Ready", "Backlog"}
