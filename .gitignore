@@ -1,0 +1,6 @@
+# Automation runtime state (local)
+automation/state.json
+automation/.worker.lock
+automation/*.log
+tmp-automation/
+__pycache__/
