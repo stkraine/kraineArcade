@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 """
-Automation worker for stkraine/kraineArcade.
+Automation worker for stkraine/kraineArcade (rate-limit optimized).
 
-Responsibilities:
-- Discover open issues and label unseen ones (`agent:seen`).
-- Sync GitHub Project (v2) status:
-  - newly seen / Backlog -> Ready
-  - when work starts -> In progress
-  - when PR opened/updated for review -> In review
-  - when PR closed/merged -> Done
-- Auto-implement actionable issues (Ready/Backlog) one at a time using `opencode run --auto`.
-- Address new feedback on In review items (issue comments + PR conversation comments).
+- Labels unseen open issues (`agent:seen`) and syncs GitHub Project (v2) status.
+- Auto-implements actionable issues (Ready/Backlog) one at a time via `opencode run --auto`.
+- Handles In review feedback (issue + PR conversation comments) and Needs info replies.
+- Moves to Done when PR is closed/merged.
 
-Requirements:
-- `gh` CLI authenticated with repo + project write scope.
-- `opencode` CLI available (default: ~/.opencode/bin/opencode).
-- Cron-friendly; uses a lockfile to prevent overlapping runs.
+Optimizations: cooldown on rate limits, cached project items/PR lookups per run,
+skip redundant status edits, reduced API calls.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
+import re
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,8 +29,10 @@ SEEN_LABEL = os.environ.get("AGENT_SEEN_LABEL", "agent:seen")
 LOG_FILE = os.environ.get("POLL_LOG_FILE")
 STATE_FILE = REPO_DIR / "automation" / "state.json"
 LOCK_FILE = REPO_DIR / "automation" / ".worker.lock"
+COOLDOWN_FILE = REPO_DIR / "automation" / ".ratelimit-cooldown"
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", str(Path.home() / ".opencode/bin/opencode"))
-OPENCODE_TIMEOUT_SEC = int(os.environ.get("OPENCODE_TIMEOUT_SEC", "3600"))  # 1 hour
+OPENCODE_TIMEOUT_SEC = int(os.environ.get("OPENCODE_TIMEOUT_SEC", "3600"))
+RATE_LIMIT_COOLDOWN_SEC = int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "900"))  # 15 min default
 
 # GitHub Projects (v2)
 PROJECT_OWNER = os.environ.get("PROJECT_OWNER", "stkraine")
@@ -54,6 +50,10 @@ STATUS_OPTIONS = {
 ENABLE_PROJECT_STATUS = os.environ.get("ENABLE_PROJECT_STATUS", "1") not in ("0", "false", "False")
 ENABLE_AUTO_WORK = os.environ.get("ENABLE_AUTO_WORK", "1") not in ("0", "false", "False")
 GH_BIN = os.environ.get("GH_BIN", "gh")
+
+
+class RateLimitError(RuntimeError):
+    pass
 
 
 def now_iso() -> str:
@@ -76,20 +76,59 @@ def env_for_gh() -> dict[str, str]:
     env = os.environ.copy()
     if not env.get("GH_TOKEN") and env.get("GITHUB_PAT"):
         env["GH_TOKEN"] = env["GITHUB_PAT"]
-    # Ensure common locations are on PATH for cron
     extra = f"{Path.home()}/.local/bin:{Path.home()}/.opencode/bin"
     env["PATH"] = extra + ":" + env.get("PATH", "")
     return env
 
 
+def is_rate_limited(text: str) -> bool:
+    t = (text or "").lower()
+    return "rate limit" in t or "abuse detection" in t or "secondary rate limit" in t
+
+
 def run(cmd: list[str], check: bool = True, cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, capture_output=True, env=env_for_gh(), check=check, cwd=str(cwd) if cwd else None, timeout=timeout)
+    res = subprocess.run(cmd, text=True, capture_output=True, env=env_for_gh(), check=False, cwd=str(cwd) if cwd else None, timeout=timeout)
+    combined = (res.stdout or "") + "\n" + (res.stderr or "")
+    if is_rate_limited(combined):
+        raise RateLimitError(combined.strip()[:500])
+    if check and res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
+    return res
 
 
 def gh_json(args: list[str], check: bool = True) -> Any:
     res = run([GH_BIN] + args, check=check)
     out = (res.stdout or "").strip()
-    return json.loads(out) if out else None
+    if not out:
+        return None
+    return json.loads(out)
+
+
+def set_cooldown(seconds: int | None = None) -> None:
+    secs = seconds if seconds is not None else RATE_LIMIT_COOLDOWN_SEC
+    until = time.time() + max(60, secs)
+    try:
+        COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        COOLDOWN_FILE.write_text(json.dumps({"until": until, "set_at": now_iso()}), encoding="utf-8")
+    except OSError:
+        pass
+    log(f"Rate limit cooldown set for ~{int(secs/60)} min")
+
+
+def cooldown_active() -> bool:
+    try:
+        if not COOLDOWN_FILE.exists():
+            return False
+        data = json.loads(COOLDOWN_FILE.read_text(encoding="utf-8"))
+        if time.time() < float(data.get("until", 0)):
+            return True
+        COOLDOWN_FILE.unlink(missing_ok=True)
+    except Exception:
+        try:
+            COOLDOWN_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return False
 
 
 def load_state() -> dict[str, Any]:
@@ -111,13 +150,11 @@ def save_state(state: dict[str, Any]) -> None:
 def acquire_lock() -> bool:
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # Atomic create
         fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(f"pid={os.getpid()}\nstarted={now_iso()}\n")
         return True
     except FileExistsError:
-        # Stale lock? If older than 2x timeout, remove.
         try:
             age = time.time() - LOCK_FILE.stat().st_mtime
             if age > OPENCODE_TIMEOUT_SEC * 2:
@@ -144,7 +181,7 @@ def ensure_label() -> None:
 
 
 def fetch_open_issues() -> list[dict[str, Any]]:
-    data = gh_json(["issue", "list", "--repo", REPO, "--state", "open", "--json", "number,title,url,labels,updatedAt", "--limit", "100"])
+    data = gh_json(["issue", "list", "--repo", REPO, "--state", "open", "--json", "number,title,url,labels,updatedAt,body", "--limit", "100"])
     return data or []
 
 
@@ -163,32 +200,45 @@ def project_item_for_issue(items: list[dict[str, Any]], issue_number: int) -> di
     return None
 
 
-def ensure_project_item(issue_url: str, issue_number: int) -> str | None:
-    items = get_project_items()
+def ensure_project_item(issue_url: str, issue_number: int, items: list[dict[str, Any]]) -> str | None:
     item = project_item_for_issue(items, issue_number)
     if item and item.get("id"):
         return item["id"]
     run([GH_BIN, "project", "item-add", PROJECT_NUMBER, "--owner", PROJECT_OWNER, "--url", issue_url], check=False)
-    items = get_project_items()
+    refreshed = get_project_items()
+    items.clear()
+    items.extend(refreshed)
     item = project_item_for_issue(items, issue_number)
     return item.get("id") if item else None
 
 
-def set_project_status(issue_url: str, issue_number: int, status_name: str) -> bool:
+def set_project_status(issue_url: str, issue_number: int, status_name: str, items: list[dict[str, Any]] | None = None) -> bool:
     if not ENABLE_PROJECT_STATUS:
         return False
     option_id = STATUS_OPTIONS.get(status_name)
     if not option_id:
         log(f"WARN: unknown status '{status_name}'")
         return False
-    item_id = ensure_project_item(issue_url, issue_number)
+    local_items = items if items is not None else get_project_items()
+    item = project_item_for_issue(local_items, issue_number)
+    if item and item.get("status") == status_name:
+        return True  # skip redundant edit
+    item_id = ensure_project_item(issue_url, issue_number, local_items)
     if not item_id:
         log(f"WARN: could not find/add project item for issue #{issue_number}")
         return False
+    # Recheck after ensure (it may have refreshed)
+    item = project_item_for_issue(local_items, issue_number)
+    if item and item.get("status") == status_name:
+        return True
     res = run([GH_BIN, "project", "item-edit", "--id", item_id, "--project-id", PROJECT_ID,
                "--field-id", PROJECT_STATUS_FIELD_ID, "--single-select-option-id", option_id], check=False)
     if res.returncode == 0:
         log(f"Project #{PROJECT_NUMBER} issue #{issue_number} -> {status_name}")
+        if item:
+            item["status"] = status_name
+        else:
+            local_items.append({"id": item_id, "status": status_name, "content": {"type": "Issue", "number": issue_number, "repository": REPO, "url": issue_url}})
         return True
     log(f"WARN: failed to set status for #{issue_number}: {(res.stderr or res.stdout).strip()}")
     return False
@@ -198,21 +248,30 @@ def add_label(issue_number: int) -> None:
     run([GH_BIN, "issue", "edit", str(issue_number), "--repo", REPO, "--add-label", SEEN_LABEL], check=False)
 
 
-def find_pr_for_issue(issue_number: int) -> dict[str, Any] | None:
-    # Search for PRs referencing the issue; prefer open, then most recent.
-    res = run([GH_BIN, "pr", "list", "--repo", REPO, "--state", "all", "--search", f"#{issue_number} in:body", "--json",
-               "number,title,url,state,headRefName,isDraft,updatedAt", "--limit", "20"], check=False)
-    if res.returncode != 0:
+def fetch_prs() -> list[dict[str, Any]]:
+    # Batch fetch: open PRs + recently updated closed/merged (for Done transitions)
+    prs: list[dict[str, Any]] = []
+    for state in ("open", "closed"):
+        data = gh_json(["pr", "list", "--repo", REPO, "--state", state, "--json",
+                        "number,title,body,url,state,headRefName,updatedAt,mergedAt,closedAt", "--limit", "50"], check=False)
+        if isinstance(data, list):
+            prs.extend(data)
+    return prs
+
+
+def pr_references_issue(pr: dict[str, Any], issue_number: int) -> bool:
+    text = f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+    # Match #N, Closes #N, Fixes #N, Resolves #N (case-insensitive)
+    return re.search(rf"(?<!\w)#\s*{issue_number}\b", text) is not None
+
+
+def find_pr_for_issue(issue_number: int, prs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    matches = [p for p in prs if pr_references_issue(p, issue_number)]
+    if not matches:
         return None
-    try:
-        prs = json.loads(res.stdout or "[]")
-    except json.JSONDecodeError:
-        return None
-    # Prefer open PRs
-    open_prs = [p for p in prs if p.get("state") == "OPEN"]
-    if open_prs:
-        return sorted(open_prs, key=lambda p: p.get("updatedAt") or "", reverse=True)[0]
-    return sorted(prs, key=lambda p: p.get("updatedAt") or "", reverse=True)[0] if prs else None
+    open_prs = [p for p in matches if p.get("state") == "OPEN"]
+    pool = open_prs or matches
+    return sorted(pool, key=lambda p: p.get("updatedAt") or p.get("mergedAt") or p.get("closedAt") or "", reverse=True)[0]
 
 
 def get_issue_comments(issue_number: int) -> list[dict[str, Any]]:
@@ -230,7 +289,6 @@ def get_pr_comments(pr_number: int) -> list[dict[str, Any]]:
 
 
 def latest_comment_marker(comments: list[dict[str, Any]]) -> str | None:
-    # Use createdAt + url/id if present as a stable marker
     if not comments:
         return None
     last = comments[-1]
@@ -238,12 +296,6 @@ def latest_comment_marker(comments: list[dict[str, Any]]) -> str | None:
 
 
 def has_new_feedback(issue_number: int, pr_number: int | None, state: dict[str, Any]) -> tuple[bool, str, bool]:
-    """Return (has_new, reason, baseline_initialized).
-
-    Baseline (skip acting) only on the very first observation of an issue with no
-    existing state entry, to avoid acting on historical pre-existing comments.
-    If state exists, marker changes are treated as new feedback.
-    """
     issues_state = state.get("issues") or {}
     has_entry = str(issue_number) in issues_state
     istate = issues_state.get(str(issue_number)) or {}
@@ -257,14 +309,12 @@ def has_new_feedback(issue_number: int, pr_number: int | None, state: dict[str, 
         return False, "baseline", True
     reasons = []
     changed = False
-    if issue_marker != prev_issue:
-        if issue_marker is not None or prev_issue is not None:
-            changed = True
-            reasons.append("new issue comment(s)")
-    if pr_marker != prev_pr:
-        if pr_marker is not None or prev_pr is not None:
-            changed = True
-            reasons.append("new PR comment(s)")
+    if issue_marker != prev_issue and (issue_marker is not None or prev_issue is not None):
+        changed = True
+        reasons.append("new issue comment(s)")
+    if pr_marker != prev_pr and (pr_marker is not None or prev_pr is not None):
+        changed = True
+        reasons.append("new PR comment(s)")
     return changed, ", ".join(reasons) if reasons else "", False
 
 
@@ -282,13 +332,12 @@ def run_opencode(prompt: str, title: str) -> tuple[bool, str]:
     if not Path(OPENCODE_BIN).exists():
         return False, f"opencode not found at {OPENCODE_BIN}"
     cmd = [OPENCODE_BIN, "run", "--auto", "--title", title, prompt]
-    log(f"Running: {' '.join(cmd[:4])} --title {title!r} <prompt>")
+    log(f"Running opencode: --title {title!r}")
     try:
         res = run(cmd, check=False, cwd=REPO_DIR, timeout=OPENCODE_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
         return False, f"opencode timed out after {OPENCODE_TIMEOUT_SEC}s"
     out = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
-    # Truncate very long output in logs
     if len(out) > 4000:
         out = out[:2000] + "\n...[truncated]...\n" + out[-1500:]
     ok = res.returncode == 0
@@ -347,56 +396,38 @@ Be thorough and safe. Do not expose secrets.
 """
 
 
-def fetch_issue_body(issue_number: int) -> str:
-    data = gh_json(["issue", "view", str(issue_number), "--repo", REPO, "--json", "body,title"], check=False)
-    if isinstance(data, dict):
-        return data.get("body") or ""
-    return ""
-
-
-def current_project_status(issue_number: int) -> str | None:
-    items = get_project_items()
-    item = project_item_for_issue(items, issue_number)
-    return (item or {}).get("status")
-
-
-def process_actionable_issue(issue: dict[str, Any], item: dict[str, Any], state: dict[str, Any]) -> None:
+def process_actionable_issue(issue: dict[str, Any], state: dict[str, Any], items: list[dict[str, Any]], prs: list[dict[str, Any]]) -> None:
     num = issue["number"]
     url = issue.get("url", "")
     title = issue.get("title", "")
     log(f"Starting work on #{num}: {title}")
-    set_project_status(url, num, "In progress")
-    body = fetch_issue_body(num)
+    set_project_status(url, num, "In progress", items)
+    body = issue.get("body") or ""
     prompt = build_implementation_prompt(issue, body)
     ok, _ = run_opencode(prompt, title=f"Issue #{num}: {title}"[:80])
-    pr = find_pr_for_issue(num)
-    if ok and pr and pr.get("state") == "OPEN":
-        set_project_status(url, num, "In review")
-        record_feedback_markers(num, pr.get("number"), state)
-        log(f"Issue #{num} -> In review (PR #{pr.get('number')})")
-        return
+    prs = fetch_prs()  # refresh after work
+    pr = find_pr_for_issue(num, prs)
     if pr and pr.get("state") == "OPEN":
-        set_project_status(url, num, "In review")
+        set_project_status(url, num, "In review", items)
         record_feedback_markers(num, pr.get("number"), state)
-        log(f"Issue #{num} has open PR #{pr.get('number')}; set to In review despite opencode exit status")
+        log(f"Issue #{num} -> In review (PR #{pr.get('number')})" + ("" if ok else " [opencode non-zero exit]"))
         return
-    # Respect agent-set statuses (e.g., "Needs info" with clarifying questions and no PR)
-    status = current_project_status(num)
+    status_item = project_item_for_issue(get_project_items(), num)
+    status = (status_item or {}).get("status")
     if status in ("Needs info", "In review", "Done"):
         record_feedback_markers(num, pr.get("number") if pr else None, state)
         log(f"Issue #{num} left in '{status}' after run (no open PR).")
         return
-    set_project_status(url, num, "Ready")
+    set_project_status(url, num, "Ready", items)
     log(f"Issue #{num} returned to Ready (no open PR detected). Check logs.")
 
 
-def process_in_review_item(issue: dict[str, Any], item: dict[str, Any], state: dict[str, Any]) -> bool:
-    """Handle In review transitions/feedback. Returns True if it took an action."""
+def process_in_review_item(issue: dict[str, Any], state: dict[str, Any], items: list[dict[str, Any]], prs: list[dict[str, Any]]) -> bool:
     num = issue["number"]
     url = issue.get("url", "")
-    pr = find_pr_for_issue(num)
+    pr = find_pr_for_issue(num, prs)
     if pr and pr.get("state") in ("CLOSED", "MERGED"):
-        set_project_status(url, num, "Done")
+        set_project_status(url, num, "Done", items)
         log(f"Issue #{num} -> Done (PR #{pr.get('number')} {pr.get('state')})")
         return True
     pr_num = pr.get("number") if pr and pr.get("state") == "OPEN" else None
@@ -407,16 +438,15 @@ def process_in_review_item(issue: dict[str, Any], item: dict[str, Any], state: d
     if not changed:
         return False
     log(f"Issue #{num} has {reason}; addressing feedback")
-    set_project_status(url, num, "In progress")
+    set_project_status(url, num, "In progress", items)
     prompt = build_feedback_prompt(num, pr or {}, reason)
     run_opencode(prompt, title=f"Feedback #{num}: {issue.get('title','')}"[:80])
-    set_project_status(url, num, "In review")
+    set_project_status(url, num, "In review", items)
     record_feedback_markers(num, pr_num, state)
     return True
 
 
-def process_needs_info_item(issue: dict[str, Any], item: dict[str, Any], state: dict[str, Any]) -> bool:
-    """If user replied with a new issue comment, move back to Ready for re-implementation."""
+def process_needs_info_item(issue: dict[str, Any], state: dict[str, Any], items: list[dict[str, Any]]) -> bool:
     num = issue["number"]
     url = issue.get("url", "")
     changed, reason, baseline = has_new_feedback(num, None, state)
@@ -426,7 +456,7 @@ def process_needs_info_item(issue: dict[str, Any], item: dict[str, Any], state: 
     if not changed:
         return False
     log(f"Issue #{num} has {reason}; moving Needs info -> Ready")
-    set_project_status(url, num, "Ready")
+    set_project_status(url, num, "Ready", items)
     record_feedback_markers(num, None, state)
     return True
 
@@ -442,13 +472,17 @@ def sync_labels_and_ready(open_issues: list[dict[str, Any]], items: list[dict[st
             add_label(num)
             log(f"NEW ISSUE #{num}: {issue.get('title','')} — {url}")
             if status in (None, "", "Backlog"):
-                set_project_status(url, num, "Ready")
+                set_project_status(url, num, "Ready", items)
         elif status == "Backlog":
-            # Normalize previously-seen backlog items
-            set_project_status(url, num, "Ready")
+            set_project_status(url, num, "Ready", items)
 
 
 def main() -> int:
+    # Small jitter to avoid thundering herd
+    time.sleep(random.uniform(0, 3))
+    if cooldown_active():
+        log("Rate-limit cooldown active; skipping run.")
+        return 0
     if not acquire_lock():
         log("Another worker run is in progress; exiting.")
         return 0
@@ -457,6 +491,7 @@ def main() -> int:
         open_issues = fetch_open_issues()
         issues_by_num = {i["number"]: i for i in open_issues}
         items = get_project_items() if ENABLE_PROJECT_STATUS else []
+        prs = fetch_prs() if ENABLE_PROJECT_STATUS else []
         sync_labels_and_ready(open_issues, items)
 
         if not ENABLE_AUTO_WORK:
@@ -464,10 +499,9 @@ def main() -> int:
             return 0
 
         state = load_state()
-        # Refresh items after sync
         items = get_project_items() if ENABLE_PROJECT_STATUS else []
+        prs = fetch_prs() if ENABLE_PROJECT_STATUS else []
 
-        # Respect single concurrency: if anything is In progress, do not start new work
         if any((it.get("status") == "In progress") for it in items):
             log("An item is already In progress; skipping new work this cycle.")
             for it in items:
@@ -475,83 +509,72 @@ def main() -> int:
                 if content.get("type") != "Issue" or content.get("repository") != REPO:
                     continue
                 num = content.get("number")
-                if it.get("status") == "In review":
-                    if num in issues_by_num:
-                        process_in_review_item(issues_by_num[num], it, state)
-                    else:
-                        pr = find_pr_for_issue(num)
-                        if pr and pr.get("state") in ("CLOSED", "MERGED"):
-                            set_project_status(content.get("url", ""), num, "Done")
+                if it.get("status") == "In review" and num in issues_by_num:
+                    process_in_review_item(issues_by_num[num], state, items, prs)
                 elif it.get("status") == "Needs info" and num in issues_by_num:
-                    process_needs_info_item(issues_by_num[num], it, state)
+                    process_needs_info_item(issues_by_num[num], state, items)
+                elif it.get("status") == "In review":
+                    pr = find_pr_for_issue(num, prs)
+                    if pr and pr.get("state") in ("CLOSED", "MERGED"):
+                        set_project_status(content.get("url", ""), num, "Done", items)
             save_state(state)
             return 0
 
-        # Phase 2: feedback on In review items (one action per cycle max)
         for it in items:
-            if it.get("status") != "In review":
-                continue
             content = it.get("content") or {}
             if content.get("type") != "Issue" or content.get("repository") != REPO:
                 continue
             num = content.get("number")
-            if num not in issues_by_num:
-                pr = find_pr_for_issue(num)
-                if pr and pr.get("state") in ("CLOSED", "MERGED"):
-                    set_project_status(content.get("url", ""), num, "Done")
-                continue
-            before = json.dumps(state.get("issues", {}).get(str(num), {}), sort_keys=True)
-            process_in_review_item(issues_by_num[num], it, state)
-            after = json.dumps(state.get("issues", {}).get(str(num), {}), sort_keys=True)
-            if before != after or (project_item_for_issue(get_project_items(), num) or {}).get("status") == "In progress":
-                save_state(state)
-                return 0
-            # record baseline markers to avoid treating old comments as new
-            pr = find_pr_for_issue(num)
-            record_feedback_markers(num, pr.get("number") if pr else None, state)
-
-        # Needs info: if user replied, move back to Ready (resume next cycle)
-        for it in items:
-            if it.get("status") != "Needs info":
-                continue
-            content = it.get("content") or {}
-            if content.get("type") == "Issue" and content.get("repository") == REPO:
-                num = content.get("number")
-                if num in issues_by_num and process_needs_info_item(issues_by_num[num], it, state):
+            if it.get("status") == "In review" and num in issues_by_num:
+                acted = process_in_review_item(issues_by_num[num], state, items, prs)
+                if acted:
                     save_state(state)
                     return 0
-        # Refresh items if needed (status may have changed externally; cheap enough to proceed)
-        items = get_project_items() if ENABLE_PROJECT_STATUS else []
+            elif it.get("status") == "In review" and num not in issues_by_num:
+                pr = find_pr_for_issue(num, prs)
+                if pr and pr.get("state") in ("CLOSED", "MERGED"):
+                    set_project_status(content.get("url", ""), num, "Done", items)
+            elif it.get("status") == "Needs info" and num in issues_by_num:
+                if process_needs_info_item(issues_by_num[num], state, items):
+                    save_state(state)
+                    return 0
 
-        # Phase 1: pick one actionable issue
-        actionable_statuses = {"Ready", "Backlog"}
-        candidates = []
+        actionable = []
         for it in items:
-            if it.get("status") not in actionable_statuses:
+            if it.get("status") not in ("Ready", "Backlog"):
                 continue
             content = it.get("content") or {}
             if content.get("type") == "Issue" and content.get("repository") == REPO:
                 num = content.get("number")
                 if num in issues_by_num:
-                    candidates.append((num, issues_by_num[num], it))
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            num, issue, item = candidates[0]
-            process_actionable_issue(issue, item, state)
+                    actionable.append((num, issues_by_num[num]))
+        if actionable:
+            actionable.sort(key=lambda x: x[0])
+            _, issue = actionable[0]
+            process_actionable_issue(issue, state, items, prs)
             save_state(state)
             return 0
 
         log("No actionable issues.")
         save_state(state)
         return 0
+    except RateLimitError as e:
+        log(f"ERROR: rate limited: {e}")
+        set_cooldown()
+        return 1
     except FileNotFoundError as e:
         log(f"ERROR: required tool not found: {e}")
         return 1
     except subprocess.CalledProcessError as e:
-        log(f"ERROR: command failed: {(e.stderr or e.stdout or str(e)).strip()}")
+        msg = (e.stderr or e.stdout or str(e)).strip()
+        log(f"ERROR: command failed: {msg}")
+        if is_rate_limited(msg):
+            set_cooldown()
         return 1
     except Exception as e:
         log(f"ERROR: {e}")
+        if is_rate_limited(str(e)):
+            set_cooldown()
         return 1
     finally:
         release_lock()
