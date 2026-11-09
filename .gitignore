@@ -45,3 +45,4 @@ desktop.ini
 
 # VS Code (optional local settings)
 .vscode/
+automation/.ratelimit-cooldown
