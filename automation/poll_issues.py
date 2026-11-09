@@ -237,25 +237,33 @@ def latest_comment_marker(comments: list[dict[str, Any]]) -> str | None:
 
 
 def has_new_feedback(issue_number: int, pr_number: int | None, state: dict[str, Any]) -> tuple[bool, str, bool]:
-    """Return (has_new, reason, baseline_initialized). If no prior markers exist, initialize baseline and do not trigger."""
-    istate = (state.get("issues") or {}).get(str(issue_number)) or {}
+    """Return (has_new, reason, baseline_initialized).
+
+    Baseline (skip acting) only on the very first observation of an issue with no
+    existing state entry, to avoid acting on historical pre-existing comments.
+    If state exists, marker changes are treated as new feedback.
+    """
+    issues_state = state.get("issues") or {}
+    has_entry = str(issue_number) in issues_state
+    istate = issues_state.get(str(issue_number)) or {}
     issue_comments = get_issue_comments(issue_number)
     pr_comments = get_pr_comments(pr_number) if pr_number else []
     issue_marker = latest_comment_marker(issue_comments)
     pr_marker = latest_comment_marker(pr_comments)
     prev_issue = istate.get("last_issue_comment")
     prev_pr = istate.get("last_pr_comment")
-    # First observation: record baseline, don't treat existing comments as new feedback.
-    if prev_issue is None and prev_pr is None:
+    if not has_entry:
         return False, "baseline", True
     reasons = []
     changed = False
-    if issue_marker and issue_marker != prev_issue:
-        changed = True
-        reasons.append("new issue comment(s)")
-    if pr_marker and pr_marker != prev_pr:
-        changed = True
-        reasons.append("new PR comment(s)")
+    if issue_marker != prev_issue:
+        if issue_marker is not None or prev_issue is not None:
+            changed = True
+            reasons.append("new issue comment(s)")
+    if pr_marker != prev_pr:
+        if pr_marker is not None or prev_pr is not None:
+            changed = True
+            reasons.append("new PR comment(s)")
     return changed, ", ".join(reasons) if reasons else "", False
 
 
